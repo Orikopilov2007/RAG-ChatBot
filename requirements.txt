@@ -1,0 +1,11 @@
+langchain
+openai
+python-dotenv
+streamlit
+astrapy
+langchain-community
+dotenv
+huggingface_hub
+uuid
+rank_bm25
+sqlalchemy

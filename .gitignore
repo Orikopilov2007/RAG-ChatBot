@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+env/
+venv/
+
+# Streamlit / local stuff
+.streamlit/
+rag_chat.db
+
+# OS / Editors
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Secrets
+.env
+*.key
