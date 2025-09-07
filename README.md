@@ -19,8 +19,6 @@ Chat with your own PDF/TXT knowledge base using a hybrid retriever (Multi-Query 
 - FAQ
 - Performance & Cost Tips
 - Roadmap
-- Contributing
-- License
 
 -------------------------------------------------------------------------------
 
@@ -233,15 +231,5 @@ A: Yes—upload many PDFs/TXTs; all are indexed together.
 
 -------------------------------------------------------------------------------
 
-## Contributing
-
-PRs welcome!
-1) Create a feature branch.
-2) Keep commits scoped and descriptive.
-3) Update README if UX/setup changes.
-
--------------------------------------------------------------------------------
-
-## License
-
 MIT — see LICENSE.
+
