@@ -1,11 +1,23 @@
-langchain
-openai
+# Core
 python-dotenv
 streamlit
-astrapy
-langchain-community
-dotenv
-huggingface_hub
-uuid
-rank_bm25
 sqlalchemy
+
+# LangChain
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-openai>=0.1.0
+langchain-text-splitters>=0.2.0
+langchain-pinecone>=0.1.0
+
+# OpenAI
+openai>=1.0.0
+
+# Pinecone
+pinecone>=5.0.0
+
+# Retrieval / ranking
+rank-bm25
+
+# Utilities
+huggingface_hub
