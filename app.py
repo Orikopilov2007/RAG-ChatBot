@@ -8,6 +8,48 @@
 # - Optional "best-effort" mode when files don't cover the answer
 # =========================================
 
+"""
+HIGH-LEVEL FLOW (plain English)
+-------------------------------
+
+This app is a chat interface that answers questions using:
+1) Your uploaded files (PDF/TXT) as a private knowledge base, and
+2) If needed, general knowledge, and
+3) If still needed, a web search (via OpenAI Responses API web_search tool).
+
+The typical lifecycle looks like this:
+
+A) App starts:
+   - Loads environment variables (OpenAI + Pinecone keys).
+   - Initializes session state and SQLite tables.
+
+B) User uploads files:
+   - We compute a fingerprint for the file set.
+   - We chunk the content into "Documents".
+   - We embed and store chunks in Pinecone under a namespace derived from the fingerprint.
+   - We also create a hybrid retriever:
+        Vector retriever (Pinecone) + lexical retriever (BM25).
+
+C) User asks a question:
+   - We decide the response language (Hebrew/English) per session (sticky override supported).
+   - We rewrite the question into a standalone form (so chat context doesn't confuse retrieval).
+   - We retrieve relevant chunks (docs) from the KB (hybrid retrieval).
+   - We check "coverage" (how many chunks we have vs. a threshold decided by GPT).
+   - Routing:
+        1) If covered -> RAG answer using ONLY the excerpts as evidence.
+        2) If not covered -> best-effort answer from general knowledge.
+        3) If that best-effort answer indicates it needs web (or force_web is on) -> do web search and append sources.
+
+D) We store conversation:
+   - Messages are saved to SQLite so sessions persist across refresh/restart.
+   - The UI allows creating, renaming (auto-title), deleting sessions, and clearing messages.
+
+The goal:
+- Be reliable when the uploaded files contain the answer.
+- Be transparent when evidence is missing.
+- Optionally use web search when needed.
+"""
+
 import os
 import tempfile
 import hashlib
@@ -81,13 +123,14 @@ class Message(Base):
     __tablename__ = "messages"
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String, ForeignKey("sessions.id"), index=True)
-    role = Column(String)  # "user" / "assistant"
+    role = Column(String)
     content = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(engine)
 
 def db_get_or_create_session(sid: str, name: str):
+    """Create session row if missing."""
     db = DB()
     obj = db.get(ChatSession, sid)
     if not obj:
@@ -96,6 +139,7 @@ def db_get_or_create_session(sid: str, name: str):
     db.close()
 
 def db_load_history(sid: str) -> InMemoryChatMessageHistory:
+    """Load session messages from SQLite into LangChain history."""
     db = DB()
     rows = db.query(Message).filter_by(session_id=sid).order_by(Message.id).all()
     hist = InMemoryChatMessageHistory()
@@ -105,12 +149,14 @@ def db_load_history(sid: str) -> InMemoryChatMessageHistory:
     return hist
 
 def db_save_message(sid: str, role: str, content: str):
+    """Persist one message (user/assistant)."""
     db = DB()
     db.add(Message(session_id=sid, role=role, content=content))
     db.commit()
     db.close()
 
 def db_delete_session(sid: str):
+    """Delete a session and all its messages."""
     db = DB()
     db.query(Message).filter_by(session_id=sid).delete()
     db.query(ChatSession).filter_by(id=sid).delete()
@@ -118,18 +164,21 @@ def db_delete_session(sid: str):
     db.close()
 
 def db_list_sessions():
+    """List sessions (newest first)."""
     db = DB()
     rows = db.query(ChatSession).order_by(ChatSession.created_at.desc()).all()
     db.close()
     return rows
 
 def db_clear_messages(sid: str):
+    """Clear messages for a session (keep session row)."""
     db = DB()
     db.query(Message).filter_by(session_id=sid).delete()
     db.commit()
     db.close()
 
 def db_update_session_name(sid: str, new_name: str):
+    """Rename a session."""
     db = DB()
     obj = db.get(ChatSession, sid)
     if obj:
@@ -141,67 +190,147 @@ def db_update_session_name(sid: str, new_name: str):
 # Language (sticky override)
 # ======================
 def detect_lang(text: str) -> str:
+    """Heuristic: Hebrew chars => 'he', else 'en'."""
     if re.search(r'[\u0590-\u05FF]', text or ""):
         return "he"
     return "en"
 
 def parse_explicit_lang_request(text: str) -> Optional[str]:
-    t = text or ""
-    # explicit, sticky
-    if re.search(r"(?:answer|respond)\s+in\s+english|(?:ענה|תענה)\s+באנגלית|באנגלית\s+בלבד", t, flags=re.IGNORECASE):
+    """
+    Detect explicit language request in the user's text.
+    Returns 'he' / 'en' / None.
+    """
+    t = (text or "").strip()
+
+    # English requests (broader)
+    if re.search(
+        r"(answer|respond|write|reply)\s+(in\s+)?english|english\s+only|"
+        r"(ענה|תענה|תכתוב|תשיב)\s+באנגלית|באנגלית(\s+בלבד)?",
+        t,
+        flags=re.IGNORECASE,
+    ):
         return "en"
-    if re.search(r"(?:answer|respond)\s+in\s+hebrew|(?:ענה|תענה)\s+בעברית|בעברית\s+בלבד", t, flags=re.IGNORECASE):
+
+    # Hebrew requests (broader)
+    if re.search(
+        r"(answer|respond|write|reply)\s+(in\s+)?hebrew|hebrew\s+only|"
+        r"(ענה|תענה|תכתוב|תשיב)\s+בעברית|בעברית(\s+בלבד)?",
+        t,
+        flags=re.IGNORECASE,
+    ):
         return "he"
+
+    # Very common shorthand: "בעברית" / "english" as standalone
+    if re.search(r"\bבעברית\b", t):
+        return "he"
+    if re.search(r"\benglish\b", t, flags=re.IGNORECASE):
+        return "en"
+
     return None
 
 def lang_instruction(lang: str) -> str:
-    return "ענה בעברית." if lang == "he" else "Answer in English."
+    """Hard instruction to keep the output language consistent."""
+    return "ענה בעברית בלבד. אל תשתמש באנגלית." if lang == "he" else "Answer in English only. Do not use Hebrew."
 
 def update_lang_pref(session_id: str, user_text: str) -> str:
-    """
-    Rule:
-    - Default: reply in the language of the user's last message
-    - If user explicitly requests a language => sticky until changed by explicit request
-    """
-    st.session_state.setdefault("lang_prefs", {})  # {sid: {"lang": "...", "sticky": bool}}
+    """Update per-session language preference (sticky only for “only/בלבד”)."""
+    st.session_state.setdefault("lang_prefs", {})
     pref = st.session_state["lang_prefs"].get(session_id, {"lang": "he", "sticky": False})
 
     explicit = parse_explicit_lang_request(user_text)
     if explicit:
-        pref = {"lang": explicit, "sticky": True}
+        sticky = bool(re.search(r"\bonly\b|בלבד", user_text or "", flags=re.IGNORECASE))
+        pref = {"lang": explicit, "sticky": sticky}
     elif not pref.get("sticky", False):
         pref["lang"] = detect_lang(user_text)
 
     st.session_state["lang_prefs"][session_id] = pref
     return pref["lang"]
 
+def system_text(lang: str, kind: str) -> str:
+    """
+    Return system instructions per language.
+    kind: 'contextualize' | 'rag' | 'general'
+    """
+    if kind == "contextualize":
+        if lang == "he":
+            return (
+                f"{lang_instruction(lang)}\n"
+                "נסח מחדש את הודעת המשתמש כשאלה עצמאית (standalone), בלי תלות בהיסטוריית השיחה. "
+                "החזר רק את השאלה המשוכתבת."
+            )
+        return (
+            f"{lang_instruction(lang)}\n"
+            "Rewrite the user's message into a fully self-contained question. "
+            "Return only the rewritten question."
+        )
+
+    if kind == "rag":
+        if lang == "he":
+            return (
+                f"{lang_instruction(lang)}\n"
+                "אתה אנליסט קפדן.\n"
+                "השתמש אך ורק בציטוטים/קטעים שסופקו כראיות.\n"
+                "אל תמציא עובדות שאינן נתמכות בקטעים.\n"
+                "הפרד תמיד בין: (A) ראיות לבין (B) הסקה.\n\n"
+                "אם נשאלת שאלה של הערכה/המלצה/השוואה שלא כתובה במפורש:\n"
+                "1) ראיות\n2) הסקה\n3) פערים/לא ידוע\n4) מסקנה/המלצה\n5) רמת ביטחון: גבוהה/בינונית/נמוכה\n"
+            )
+        return (
+            f"{lang_instruction(lang)}\n"
+            "You are a rigorous analyst.\n"
+            "Use ONLY the provided excerpts as evidence.\n"
+            "Never invent facts not supported by the excerpts.\n"
+            "Always separate: (A) Evidence vs (B) Inference.\n\n"
+            "If asked for evaluation/recommendation/comparison not explicitly stated:\n"
+            "1) Evidence\n2) Inference\n3) Gaps/Unknowns\n4) Conclusion/Recommendation\n5) Confidence: High/Medium/Low\n"
+        )
+
+    # kind == "general"
+    if lang == "he":
+        return (
+            f"{lang_instruction(lang)}\n"
+            "אתה עוזר מועיל.\n"
+            "אין מספיק כיסוי מהקבצים שהועלו, אז תענה כמיטב יכולתך מידע כללי.\n\n"
+            "חשוב: הוסף בסוף בדיוק שורה אחת (באנגלית, לא לתרגם):\n"
+            "NEEDS_WEB: YES\n"
+            "או\n"
+            "NEEDS_WEB: NO\n"
+        )
+    return (
+        f"{lang_instruction(lang)}\n"
+        "You are a helpful assistant.\n"
+        "The uploaded files did not provide enough evidence.\n"
+        "Answer from general knowledge as best-effort.\n\n"
+        "IMPORTANT: Append exactly ONE final line (in English token, do not translate):\n"
+        "NEEDS_WEB: YES\n"
+        "or\n"
+        "NEEDS_WEB: NO\n"
+    )
+
 # ======================
 # Session State
 # ======================
 def init_session_state():
+    """Initialize st.session_state keys used by the app."""
     st.session_state.setdefault("connected", False)
     st.session_state.setdefault("vstore", None)
     st.session_state.setdefault("bm25", None)
     st.session_state.setdefault("docs", [])
 
-    # ✅ קריטי: חסר אצלך
-    st.session_state.setdefault("history_store", {})  # {session_id: InMemoryChatMessageHistory}
-
+    st.session_state.setdefault("history_store", {})
     st.session_state.setdefault("session_index", {s.id: {"name": s.name} for s in db_list_sessions()})
     st.session_state.setdefault("current_session", next(iter(st.session_state.session_index.keys()), None))
     st.session_state.setdefault("chain", None)
 
-    # answering mode (kept as defaults; not user-facing)
-    st.session_state.setdefault("allow_guess", True)   # ✅ תמיד דלוק
-    st.session_state.setdefault("auto_web", True)      # ✅ תמיד דלוק (allow web)
-    st.session_state.setdefault("force_web", False)    # ✅ תמיד כבוי
-    st.session_state.setdefault("show_debug", True)    # ✅ תמיד דלוק
+    st.session_state.setdefault("allow_guess", True)
+    st.session_state.setdefault("auto_web", True)
+    st.session_state.setdefault("force_web", False)
+    st.session_state.setdefault("show_debug", True)
 
-    # indexing guards
     st.session_state.setdefault("indexed_fp", None)
     st.session_state.setdefault("index_namespace", None)
 
-    # retriever pieces
     st.session_state.setdefault("base_retriever", None)
     st.session_state.setdefault("compressor", None)
 
@@ -211,6 +340,7 @@ init_session_state()
 # Chat/session helpers
 # ======================
 def create_chat(name: str = "Untitled") -> str:
+    """Create a new chat session and set it active."""
     sid = uuid.uuid4().hex[:8]
     db_get_or_create_session(sid, name)
     st.session_state.session_index[sid] = {"name": name}
@@ -219,6 +349,7 @@ def create_chat(name: str = "Untitled") -> str:
     return sid
 
 def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+    """Return cached history; load from DB if missing."""
     hist = st.session_state.history_store.get(session_id)
     if hist is not None:
         return hist
@@ -230,6 +361,7 @@ def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
 # Connection (no UI keys)
 # ======================
 def ensure_connected() -> bool:
+    """Init OpenAI + Pinecone + embeddings + LLMs."""
     try:
         openai_key = os.getenv("OPENAI_API_KEY", "")
         pinecone_key = os.getenv("PINECONE_API_KEY", "")
@@ -248,8 +380,6 @@ def ensure_connected() -> bool:
             model="text-embedding-3-large",
             openai_api_key=openai_key,
         )
-
-        # ✅ חשוב: נשמר לשימוש ב-EmbeddingsFilter
         st.session_state.embedding = embedding
 
         pc = Pinecone(api_key=pinecone_key)
@@ -265,11 +395,7 @@ def ensure_connected() -> bool:
         return False
 
 def ensure_indexed(uploaded_files, chunk_size: int, chunk_overlap: int):
-    """
-    Auto-index only when needed:
-    - new file set -> index
-    - same file set -> no-op
-    """
+    """Index uploaded files once per unique fingerprint, then build retriever+chain."""
     if not uploaded_files:
         st.warning("Upload at least one PDF/TXT file.")
         st.stop()
@@ -277,7 +403,6 @@ def ensure_indexed(uploaded_files, chunk_size: int, chunk_overlap: int):
     fp = files_fingerprint(uploaded_files)
     namespace = f"kb-{fp}"
 
-    # already indexed this exact file set
     if st.session_state.get("indexed_fp") == fp and st.session_state.get("chain") is not None:
         return
 
@@ -312,12 +437,13 @@ VEC_K = 12
 VEC_FETCH_K = 40
 
 def load_uploaded_files_to_docs(uploaded_files, csize: int, coverlap: int) -> List[Document]:
+    """Load PDF/TXT uploads and split into chunked Documents."""
     all_docs: List[Document] = []
     splitter = RecursiveCharacterTextSplitter(chunk_size=csize, chunk_overlap=coverlap)
 
     for uf in uploaded_files or []:
         fname = uf.name
-        data = uf.getvalue()  # safe to call multiple times
+        data = uf.getvalue()
 
         if fname.lower().endswith(".txt"):
             text = data.decode("utf-8", errors="ignore")
@@ -336,7 +462,6 @@ def load_uploaded_files_to_docs(uploaded_files, csize: int, coverlap: int) -> Li
                 loader = PyPDFLoader(tmp_path)
                 pdf_pages = loader.load()
             finally:
-                # ✅ תמיד מנקים את הקובץ הזמני
                 try:
                     os.remove(tmp_path)
                 except OSError:
@@ -350,7 +475,7 @@ def load_uploaded_files_to_docs(uploaded_files, csize: int, coverlap: int) -> Li
     return all_docs
 
 def files_fingerprint(uploaded_files) -> str:
-    """Stable fingerprint for the current set of uploaded files."""
+    """Stable short hash for the current upload set."""
     h = hashlib.sha256()
     for uf in uploaded_files or []:
         data = uf.getvalue()
@@ -360,17 +485,14 @@ def files_fingerprint(uploaded_files) -> str:
     return h.hexdigest()[:16]
 
 # ======================
-# Retrieval: Hybrid (Vector MQR + BM25)
+# Retrieval: Hybrid (Vector + BM25)
 # ======================
 def build_hybrid_retriever(docs: List[Document]):
+    """Create EnsembleRetriever + EmbeddingsFilter and store in session_state."""
     vstore = st.session_state.vstore
     namespace = st.session_state.get("index_namespace")
 
-    search_kwargs = {
-        "k": 12,
-        "fetch_k": 80,
-        "lambda_mult": 0.5,
-    }
+    search_kwargs = {"k": 12, "fetch_k": 80, "lambda_mult": 0.5}
     if namespace:
         search_kwargs["namespace"] = namespace
 
@@ -381,7 +503,6 @@ def build_hybrid_retriever(docs: List[Document]):
 
     base = EnsembleRetriever(retrievers=[vec, bm25], weights=[0.8, 0.2])
 
-    # שמור גם את ה-base וגם את הקומפרסור כדי שלא "ייאבד" כיסוי בגלל סינון אגרסיבי
     st.session_state.base_retriever = base
     st.session_state.compressor = EmbeddingsFilter(
         embeddings=st.session_state.embedding,
@@ -390,20 +511,15 @@ def build_hybrid_retriever(docs: List[Document]):
     return base
 
 def openai_web_search_answer(question: str, lang: str) -> tuple[str, list[str]]:
-    """
-    Uses OpenAI Responses API web_search tool to answer with sources.
-    Ensures answer language follows the user's language preference.
-    """
+    """Web search via Responses API; returns (answer, urls)."""
     try:
         openai_key = os.getenv("OPENAI_API_KEY", "")
         if not openai_key:
             return "(Web search failed: missing OPENAI_API_KEY)", []
 
         client = OpenAI(api_key=openai_key)
-
         model = os.getenv("OPENAI_WEB_MODEL", "gpt-4o-mini")
 
-        # Keep the web answer in the desired language
         web_input = (
             f"{lang_instruction(lang)}\n"
             "If you use web information, keep it concise and factual.\n"
@@ -421,7 +537,6 @@ def openai_web_search_answer(question: str, lang: str) -> tuple[str, list[str]]:
         text = getattr(resp, "output_text", None) or ""
         sources: list[str] = []
 
-        # best-effort extraction
         try:
             data = resp.model_dump()
             for item in data.get("output", []):
@@ -440,19 +555,17 @@ def openai_web_search_answer(question: str, lang: str) -> tuple[str, list[str]]:
         return f"(Web search failed: {e})", []
 
 def user_requested_web(q: str) -> bool:
+    """Detect explicit request to use web search."""
     if not q:
         return False
     return bool(re.search(
-        r"(?:\bweb\b|\bgoogle\b|אינטרנט|בדוק באינטרנט|חפש|חיפוש|תבדוק|check online|search online|requirements)",
+        r"(?:\bweb\b|\bgoogle\b|web\s*search|search\s+online|check\s+online|אינטרנט|ב-?גוגל|חיפוש|חפש+|לחפש+|בדוק\s+באינטרנט|תבדוק\s+באינטרנט|requirements)",
         q,
         flags=re.IGNORECASE
     ))
 
 def decide_min_evidence(question: str, lang: str) -> int:
-    """
-    Decided by GPT (per user requirement).
-    Returns an integer threshold for "covered" before using RAG-only answers.
-    """
+    """Ask a small LLM for a min-evidence threshold; fallback heuristic on error."""
     try:
         llm = st.session_state.rewriter_llm
         prompt = (
@@ -473,38 +586,35 @@ def decide_min_evidence(question: str, lang: str) -> int:
         v = int(data.get("min_evidence", 2))
         return v if v in (1, 2, 3, 4, 6) else 2
     except Exception:
-        # safe fallback (minimal change): heuristic
         q = (question or "").strip()
         if len(q) > 220 or re.search(r"(השווה|השווא|compare|pros|cons|יתרונות|חסרונות|מיפוי|תוכנית|אסטרטגיה|policy)", q, re.IGNORECASE):
             return 3
         return 2
 
 def build_chain():
+    """Build the main chain: rewrite -> retrieve -> route (RAG/general/web)."""
     qa_llm = st.session_state.qa_llm
 
     base_retriever = st.session_state.get("base_retriever")
     compressor = st.session_state.get("compressor")
-
     if base_retriever is None or compressor is None:
         return None
 
     contextualize_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "Rewrite the user's message into a fully self-contained question. "
-         "Return only the rewritten question. "
-         "Keep the same language as the user's message."),
+        ("system", "{ctx_sys}"),
         MessagesPlaceholder("history"),
         ("human", "{question}")
     ])
 
     standalone_question = (
-        {"question": itemgetter("question"), "history": itemgetter("history")}
+        {"question": itemgetter("question"), "history": itemgetter("history"), "ctx_sys": itemgetter("ctx_sys")}
         | contextualize_prompt
         | st.session_state.rewriter_llm
         | StrOutputParser()
     )
 
     def format_docs(docs_):
+        """Format retrieved docs into a compact context string."""
         if not docs_:
             return "(no relevant excerpts found)"
         out = []
@@ -514,75 +624,59 @@ def build_chain():
             out.append(f"[{i+1}] ({fn}#{cid})\n{d.page_content}")
         return "\n\n".join(out)
 
-    # 1) Pull docs BEFORE compression (so doc_count reflects real recall)
     qa_inputs = (
         RunnablePassthrough
         .assign(
             history=itemgetter("history"),
             question=itemgetter("question"),
             lang=itemgetter("lang"),
-            rewritten=standalone_question
+            ctx_sys=RunnableLambda(lambda x: system_text(x.get("lang", "he"), "contextualize")),
         )
+        .assign(rewritten=standalone_question)
         .assign(raw_docs=itemgetter("rewritten") | base_retriever | RunnableLambda(lambda d: d or []))
         .assign(doc_count=RunnableLambda(lambda x: len(x["raw_docs"])))
     )
 
     rag_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "{lang_instr}\n"
-         "You are a rigorous analyst.\n"
-         "Use ONLY the provided excerpts as evidence.\n"
-         "Never invent facts not supported by the excerpts.\n"
-         "Always separate: (A) Evidence vs (B) Inference.\n\n"
-         "If the user asks for an evaluation / recommendation / comparison / conclusion that is not explicitly stated, you MUST:\n"
-         "1) Evidence\n2) Inference\n3) Gaps/Unknowns\n4) Conclusion/Recommendation\n5) Confidence: High/Medium/Low\n"
-        ),
+        ("system", "{rag_sys}"),
         MessagesPlaceholder("history"),
         ("human", "Question: {question}\n\nRelevant excerpts:\n{context}")
     ])
 
     general_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "{lang_instr}\n"
-         "You are a helpful assistant.\n"
-         "The uploaded files did not provide enough evidence.\n"
-         "Answer from general knowledge as best-effort.\n\n"
-         "IMPORTANT: Append exactly ONE final line (in English token, do not translate):\n"
-         "NEEDS_WEB: YES\n"
-         "or\n"
-         "NEEDS_WEB: NO\n"
-        ),
+        ("system", "{gen_sys}"),
         MessagesPlaceholder("history"),
         ("human", "Question: {question}")
     ])
 
     def parse_needs_web(text: str) -> tuple[str, bool]:
-        m = re.search(r"\nNEEDS_WEB:\s*(YES|NO)\s*$", text.strip(), flags=re.IGNORECASE)
+        """Extract NEEDS_WEB control line and return (clean_text, needs_web)."""
+        t = (text or "").strip()
+        m = re.search(r"NEEDS_WEB:\s*(YES|NO)", t, flags=re.IGNORECASE)
         if not m:
-            return text.strip(), False
+            return t, False
         needs = (m.group(1).upper() == "YES")
-        cleaned = re.sub(r"\nNEEDS_WEB:\s*(YES|NO)\s*$", "", text.strip(), flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"\s*NEEDS_WEB:\s*(YES|NO)\s*", "", t, flags=re.IGNORECASE).strip()
         return cleaned, needs
 
     def answer_router(x: dict):
+        """Route to rag/general/web and return a result dict."""
         docs = x.get("raw_docs") or []
         doc_count = int(x.get("doc_count", 0))
 
-        force_web = bool(st.session_state.get("force_web", False))  # default False
-        auto_web = bool(st.session_state.get("auto_web", True))     # default True
+        force_web = bool(st.session_state.get("force_web", False))
+        auto_web = bool(st.session_state.get("auto_web", True))
 
-        # language
         lang = x.get("lang", "he")
-        lang_instr = lang_instruction(lang)
+        rag_sys = system_text(lang, "rag")
+        gen_sys = system_text(lang, "general")
 
-        # ✅ decide threshold via GPT (not user-facing)
         min_ev = decide_min_evidence(x.get("rewritten", "") or x.get("question", ""), lang)
 
-        # ✅ detect explicit user intent to use the internet
-        raw_user_q = x.get("question", "")  # original user input (not rewritten)
+        raw_user_q = x.get("question", "")
         explicit_web = user_requested_web(raw_user_q)
 
-        # ✅ If user explicitly asked for web -> go web (even if docs exist)
+        # Explicit web request
         if explicit_web and auto_web:
             web_text, web_sources = openai_web_search_answer(x["rewritten"], lang)
             return {
@@ -597,7 +691,7 @@ def build_chain():
                 "lang": lang,
             }
 
-        # A) Covered by docs => RAG
+        # RAG
         if doc_count >= min_ev and doc_count > 0:
             try:
                 compressed_docs = compressor.compress_documents(docs, x["rewritten"]) or docs
@@ -610,7 +704,7 @@ def build_chain():
                 "question": x["rewritten"],
                 "context": context,
                 "history": x["history"],
-                "lang_instr": lang_instr,
+                "rag_sys": rag_sys,
             })
 
             return {
@@ -625,15 +719,14 @@ def build_chain():
                 "lang": lang,
             }
 
-        # B) Not covered => General best-effort
+        # General
         gen = (general_prompt | qa_llm | StrOutputParser()).invoke({
             "question": x["rewritten"],
             "history": x["history"],
-            "lang_instr": lang_instr,
+            "gen_sys": gen_sys,
         })
         gen_clean, needs_web = parse_needs_web(gen)
 
-        # If force_web is on -> always web when not covered
         if not force_web and (not needs_web or not auto_web):
             return {
                 "answer": gen_clean,
@@ -647,11 +740,9 @@ def build_chain():
                 "lang": lang,
             }
 
-        # C) Web search
+        # Web
         web_text, web_sources = openai_web_search_answer(x["rewritten"], lang)
-        final = (
-            f"{gen_clean}\n\n---\n\n{web_text}"
-        )
+        final = f"{gen_clean}\n\n---\n\n{web_text}"
         return {
             "answer": final,
             "sources": [],
@@ -664,12 +755,13 @@ def build_chain():
             "lang": lang,
         }
 
-    # diagnostics in sidebar (optional) - kept ON by default, not user-facing
     def debug_print_fn(x: dict):
+        """Sidebar debug (optional)."""
         if st.session_state.get("show_debug", True):
             st.sidebar.caption(
                 f"🧭 Standalone: {x.get('rewritten','')}\n\n"
-                f"📄 docs(before-compress): {len(x.get('raw_docs') or [])}"
+                f"📄 docs(before-compress): {len(x.get('raw_docs') or [])}\n\n"
+                f"💬 history: {len(x.get('history') or [])}"
             )
         return x
 
@@ -695,7 +787,7 @@ title_prompt = ChatPromptTemplate.from_template(
 )
 
 def auto_title_if_needed(session_id: str, question: str, answer_text: str):
-    # ensure the session exists in index
+    """Auto-title a new/default chat based on first Q/A."""
     if session_id not in st.session_state.session_index:
         db_get_or_create_session(session_id, "Untitled")
         st.session_state.session_index[session_id] = {"name": "Untitled"}
@@ -735,7 +827,6 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("🧠 Answering mode")
-    # ✅ user requested these to be defaults, not user-facing toggles
     st.success("✅ Best-effort is always ON (Docs → General → Web)")
     st.caption("Defaults: Web allowed ✅ | Diagnostics ✅ | Force web ❌")
     st.caption("Coverage threshold is decided by GPT per question (not user-controlled).")
@@ -798,7 +889,6 @@ can_run = bool(OPENAI_API_KEY) and bool(PINECONE_API_KEY) and bool(files)
 question = st.chat_input("Type your question...", disabled=not can_run)
 
 if question:
-    # update language preference per session (sticky override supported)
     lang = update_lang_pref(sid, question)
 
     if not st.session_state.get("connected", False):
@@ -831,7 +921,6 @@ if question:
         web_sources = res.get("web_sources", []) or []
         min_ev_used = res.get("min_evidence_used", None)
 
-        # ✅ Status strip / badge
         cols = st.columns([0.55, 0.45])
         with cols[0]:
             if mode == "rag":
@@ -851,7 +940,6 @@ if question:
             elif mode == "web":
                 st.caption("Order: Docs → General → Web")
 
-        # ✅ Optional diagnostics (default ON; not user-toggle)
         if st.session_state.get("show_debug", True) and rewritten:
             with st.expander("🔎 Diagnostics"):
                 st.write("Standalone / rewritten question:")
@@ -860,12 +948,12 @@ if question:
                 if min_ev_used is not None:
                     st.write(f"min_evidence (GPT-decided): {min_ev_used}")
                 st.write(f"auto_web: {st.session_state.get('auto_web', True)} | force_web: {st.session_state.get('force_web', False)}")
-                st.write(f"lang: {lang}")
+                pref = st.session_state.get("lang_prefs", {}).get(sid, {})
+                st.write(f"lang: {lang} | sticky: {pref.get('sticky', False)}")
 
         answer_text = res["answer"]
         st.markdown(answer_text)
 
-        # ✅ Show web sources inline when web was used (so user sees SOURCES)
         if mode == "web" and web_sources:
             st.markdown("### Sources")
             for url in web_sources[:10]:
@@ -874,16 +962,13 @@ if question:
         db_save_message(sid, "assistant", answer_text)
         auto_title_if_needed(sid, question, answer_text)
 
-    # keep the existing sources expander (local + web)
     with st.expander("🔎 Sources"):
-        # local sources
         for i, d in enumerate(res.get("sources", []) or [], 1):
             meta = d.metadata
             src = meta.get("filename") or meta.get("source", "source")
             cid = meta.get("chunk_id", "?")
             st.markdown(f"**[{i}]** `{src}#{cid}`\n\n{d.page_content[:400]}…")
 
-        # web sources
         web_sources = res.get("web_sources", []) or []
         if web_sources:
             st.markdown("### Web sources")
